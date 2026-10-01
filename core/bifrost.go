@@ -4910,6 +4910,10 @@ type RealtimeTurnHooks struct {
 	Cleanup        func()
 }
 
+// The private key cannot be supplied as a request header or forged by a plugin.
+// Its value identifies the exact Responses request routed by the WS transport.
+type wsPreRoutedResponsesKey struct{}
+
 // RunPreRequestHooks acquires a plugin pipeline and runs PreRequestHook on each LLM plugin
 // for callers that do not flow through handleRequest/handleStreamRequest — primarily realtime
 // WebSocket upgrades, where the upgrade itself is the routing decision (once per WS connection)
@@ -4932,6 +4936,9 @@ func (bifrost *Bifrost) RunPreRequestHooks(ctx *schemas.BifrostContext, req *sch
 	pipeline := bifrost.getPluginPipeline()
 	defer bifrost.releasePluginPipeline(pipeline)
 	pipeline.RunPreRequestHooks(ctx, req)
+	if req.RequestType == schemas.WebSocketResponsesRequest && req.ResponsesRequest != nil {
+		ctx.SetValue(wsPreRoutedResponsesKey{}, req.ResponsesRequest)
+	}
 	// This path has no downstream post-hook cleanup, so drain any plugin logs
 	// emitted by PreRequestHook here to avoid them bleeding into a later request
 	// on a reused/long-lived context (e.g. realtime WS connections).
@@ -8639,6 +8646,13 @@ func (p *PluginPipeline) RunLLMPreHooks(ctx *schemas.BifrostContext, req *schema
 // Per-request semantics: unlike PreLLMHook (which runs again on every fallback), PreRequestHook
 // runs exactly once at the top of handleRequest/handleStreamRequest, before any fan-out.
 func (p *PluginPipeline) RunPreRequestHooks(ctx *schemas.BifrostContext, req *schemas.BifrostRequest) {
+	// A native WS dial can fail before the first response, triggering the HTTP
+	// bridge. Consume the routing marker once, only for the same request object.
+	if req.RequestType == schemas.ResponsesStreamRequest && req.ResponsesRequest != nil {
+		if routed := ctx.GetAndSetValue(wsPreRoutedResponsesKey{}, nil); routed == req.ResponsesRequest {
+			return
+		}
+	}
 	// If the skip plugin pipeline flag is set, skip the plugin pipeline
 	if skipPluginPipeline, ok := ctx.Value(schemas.BifrostContextKeySkipPluginPipeline).(bool); ok && skipPluginPipeline {
 		return

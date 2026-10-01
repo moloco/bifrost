@@ -4548,3 +4548,32 @@ func TestSDKFidelityDecisionRequestNullStateReachesProvider(t *testing.T) {
 		t.Errorf("provider must receive state null, got bodies %v", bodies)
 	}
 }
+
+func TestPreRequestHooksConsumeWSRoutingMarkerOnlyForMatchingRequest(t *testing.T) {
+	for _, same := range []bool{true, false} {
+		t.Run(fmt.Sprintf("same_request_%t", same), func(t *testing.T) {
+			p := newRoutingCommitPipeline(&fakeRoutingPlugin{name: "route", pinKeyID: "routed-key"})
+			ctx := schemas.NewBifrostContext(context.Background(), time.Time{})
+			routed := &schemas.BifrostResponsesRequest{Model: "before"}
+			current := routed
+			if !same {
+				current = &schemas.BifrostResponsesRequest{Model: "different"}
+			}
+			ctx.SetValue(wsPreRoutedResponsesKey{}, routed)
+			req := &schemas.BifrostRequest{RequestType: schemas.ResponsesStreamRequest, ResponsesRequest: current}
+			p.RunPreRequestHooks(ctx, req)
+			_, ran := ctx.Value(schemas.BifrostContextKeyAPIKeyID).(string)
+			if ran == same {
+				t.Fatalf("routing ran=%v for matching request=%v", ran, same)
+			}
+			if ctx.Value(wsPreRoutedResponsesKey{}) != nil {
+				t.Fatal("routing marker was not consumed")
+			}
+			// Even reusing the same request/context must not skip another request's hooks.
+			p.RunPreRequestHooks(ctx, req)
+			if ctx.Value(schemas.BifrostContextKeyAPIKeyID) != "routed-key" {
+				t.Fatal("routing skipped more than once")
+			}
+		})
+	}
+}
