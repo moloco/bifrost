@@ -174,22 +174,6 @@ func (h *WSResponsesHandler) handleResponseCreate(session *bfws.Session, auth *a
 		return
 	}
 
-	// Store override: default to store=true (Codex sends false by default but expects true).
-	// If DisableStore is set in provider config, force store=false.
-	// If client explicitly sets store, respect that value unless DisableStore overrides it.
-	provider, modelName := schemas.ParseModelString(event.Model, schemas.OpenAI)
-	if provider == "" || modelName == "" {
-		writeWSError(session, 400, "invalid_request_error", "failed to parse model string")
-		return
-	}
-
-	if providerCfg, cfgErr := h.config.GetProviderConfigRaw(provider); cfgErr == nil &&
-		providerCfg.OpenAIConfig != nil && providerCfg.OpenAIConfig.DisableStore {
-		event.Store = schemas.Ptr(false)
-	} else {
-		event.Store = schemas.Ptr(true)
-	}
-
 	bifrostReq, err := h.convertEventToRequest(&event)
 	if err != nil {
 		writeWSError(session, 400, "invalid_request_error", err.Error())
@@ -214,6 +198,31 @@ func (h *WSResponsesHandler) handleResponseCreate(session *bfws.Session, auth *a
 		bifrostCtx.SetValue(schemas.BifrostContextKeyParentRequestID, session.ID())
 	}
 
+	// Routing must happen before provider lookup, key selection and dialing.
+	// Core remembers this exact request so a first-turn HTTP bridge does not
+	// repeat the once-per-request routing hooks.
+	routed := &schemas.BifrostRequest{RequestType: schemas.WebSocketResponsesRequest, ResponsesRequest: bifrostReq}
+	h.client.RunPreRequestHooks(bifrostCtx, routed)
+	bifrostReq = routed.ResponsesRequest
+	if bifrostReq == nil || bifrostReq.Provider == "" || bifrostReq.Model == "" {
+		cancel()
+		writeWSError(session, 400, "invalid_request_error", "invalid routed WebSocket response request")
+		return
+	}
+
+	if bifrostReq.Params == nil {
+		bifrostReq.Params = &schemas.ResponsesParameters{}
+	}
+	// Honor an explicit client value unless the routed provider disables store.
+	store := bifrostReq.Params.Store
+	if cfg, err := h.config.GetProviderConfigRaw(bifrostReq.Provider); err == nil && cfg.OpenAIConfig != nil && cfg.OpenAIConfig.DisableStore {
+		store = schemas.Ptr(false)
+	} else if store == nil {
+		store = schemas.Ptr(true)
+	}
+	bifrostReq.Params.Store = store
+	event.Store = store
+
 	// Rewrite the raw event for upstream: strip provider/ prefix from model,
 	// apply store override. The original bytes contain the bifrost-format model
 	// (e.g. "openai/gpt-5.5") which upstream providers don't understand.
@@ -229,7 +238,15 @@ func (h *WSResponsesHandler) handleResponseCreate(session *bfws.Session, auth *a
 		return
 	}
 
-	// Fall back to HTTP bridge
+	// A continuation may contain only a delta. Do not send it to an HTTP
+	// endpoint that lacks this connection's state or silently drop its parent ID.
+	if bifrostReq.Params.PreviousResponseID != nil && *bifrostReq.Params.PreviousResponseID != "" {
+		cancel()
+		writeWSError(session, 400, "previous_response_not_found", "WebSocket continuation unavailable; retry with full input and no previous_response_id")
+		return
+	}
+
+	// Fall back to HTTP bridge for a request carrying its own input.
 	h.executeHTTPBridge(session, bifrostCtx, cancel, bifrostReq)
 }
 
@@ -703,7 +720,7 @@ func (h *WSResponsesHandler) convertEventToRequest(event *schemas.WebSocketRespo
 			}
 		}
 	}
-	if len(input) == 0 {
+	if len(input) == 0 && event.PreviousResponseID == "" {
 		return nil, errInputRequired
 	}
 
@@ -802,6 +819,51 @@ func createBifrostContextFromAuth(handlerStore lib.HandlerStore, auth *authHeade
 			ctx.SetValue(schemas.BifrostContextKeyVirtualKey, auth.googAPIKey)
 		}
 	}
+	// Each event owns its header/dimension maps; plugins must not mutate the
+	// connection's captured headers or lose OAuth attribution on later events.
+	requestHeaders := make(map[string]string, len(auth.headers))
+	dimensions := make(map[string]string)
+	for name, values := range auth.headers {
+		name = strings.ToLower(name)
+		for _, value := range values {
+			requestHeaders[name] = value
+			if label, ok := strings.CutPrefix(name, "x-bf-dim-"); ok && label != "" && label != "path" && label != "method" {
+				dimensions[label] = value
+			}
+		}
+	}
+	ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, requestHeaders)
+	if len(dimensions) > 0 {
+		ctx.SetValue(schemas.BifrostContextKeyDimensions, dimensions)
+	}
+
+	// Match HTTP direct-key extraction: require both administrator and caller
+	// opt-in. Authorization stays out of generic forwarded extra headers.
+	if handlerStore != nil && handlerStore.ShouldAllowDirectKeys() && requestHeaders["x-bf-direct-key"] == "true" {
+		var directKey string
+		if strings.HasPrefix(strings.ToLower(auth.authorization), "bearer ") {
+			token := strings.TrimSpace(auth.authorization[7:])
+			if token != "" && !strings.HasPrefix(strings.ToLower(token), "sk-bf-") {
+				directKey = token
+			}
+		}
+		if directKey == "" {
+			for _, value := range []string{auth.apiKey, auth.googAPIKey} {
+				value = strings.TrimSpace(value)
+				if value != "" && !strings.HasPrefix(strings.ToLower(value), "sk-bf-") {
+					directKey = value
+					break
+				}
+			}
+		}
+		if directKey != "" {
+			ctx.SetValue(schemas.BifrostContextKeyDirectKey, schemas.Key{
+				ID: "header-provided", Name: "header-provided",
+				Value: schemas.SecretVar{Val: directKey}, Models: []string{}, Weight: 1.0,
+			})
+		}
+	}
+
 	// The headers captured at upgrade are all this connection will ever present, so the identity is
 	// settled here the way the HTTP path settles it, a connection that presented nothing included:
 	// governance refuses a request nobody settled, and a keyless connection is not that.
