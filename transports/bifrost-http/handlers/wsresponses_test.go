@@ -18,7 +18,8 @@ import (
 )
 
 type testWSHandlerStore struct {
-	matcher *lib.HeaderMatcher
+	matcher         *lib.HeaderMatcher
+	allowDirectKeys bool
 }
 
 func (s testWSHandlerStore) GetHeaderMatcher() *lib.HeaderMatcher {
@@ -47,7 +48,7 @@ func (s testWSHandlerStore) GetMCPHeaderCombinedAllowlist() schemas.WhiteList {
 
 func (s testWSHandlerStore) ShouldAllowPerRequestStorageOverride() bool { return false }
 func (s testWSHandlerStore) ShouldAllowPerRequestRawOverride() bool     { return false }
-func (s testWSHandlerStore) ShouldAllowDirectKeys() bool                { return false }
+func (s testWSHandlerStore) ShouldAllowDirectKeys() bool                { return s.allowDirectKeys }
 func (s testWSHandlerStore) GetMCPExternalServerURL() string            { return "" }
 func (s testWSHandlerStore) GetMCPExternalClientURL() string            { return "" }
 
@@ -285,4 +286,76 @@ func TestHasWebSocketForwardedHeaders(t *testing.T) {
 		"x-trace-id": {"abc-123"},
 	})
 	assert.True(t, hasWebSocketForwardedHeaders(ctx))
+}
+
+// Captured handshake credentials must survive each independently created event context.
+func TestCreateBifrostContextFromAuth_DirectKeyHeaders(t *testing.T) {
+	var handshake fasthttp.RequestCtx
+	handshake.Request.Header.Set("Authorization", "Bearer test-oauth-token")
+	handshake.Request.Header.Set("x-bf-vk", "sk-bf-test")
+	handshake.Request.Header.Set("x-bf-direct-key", "true")
+	handshake.Request.Header.Set("x-bf-dim-oauth-email", "test@example.com")
+	auth := captureAuthHeaders(&handshake)
+	ctx, cancel := createBifrostContextFromAuth(testWSHandlerStore{allowDirectKeys: true}, auth)
+	defer cancel()
+	assert.Equal(t, "sk-bf-test", ctx.Value(schemas.BifrostContextKeyVirtualKey))
+	headers, ok := ctx.Value(schemas.BifrostContextKeyRequestHeaders).(map[string]string)
+	if !ok {
+		t.Fatal("missing captured request headers")
+	}
+	assert.Equal(t, "Bearer test-oauth-token", headers["authorization"])
+	assert.Equal(t, "true", headers["x-bf-direct-key"])
+	assert.Equal(t, "sk-bf-test", headers["x-bf-vk"])
+	assert.Equal(t, "test@example.com", headers["x-bf-dim-oauth-email"])
+	assert.Equal(t, "test@example.com", ctx.Value(schemas.BifrostContextKeyDimensions).(map[string]string)["oauth-email"])
+	key, ok := ctx.Value(schemas.BifrostContextKeyDirectKey).(schemas.Key)
+	if !ok {
+		t.Fatal("missing direct key")
+	}
+	assert.Equal(t, "test-oauth-token", key.Value.Val)
+	assert.Equal(t, "header-provided", key.ID)
+	// A plugin changing one event's headers must not alter later events.
+	headers["authorization"] = "changed"
+	next, nextCancel := createBifrostContextFromAuth(testWSHandlerStore{allowDirectKeys: true}, auth)
+	defer nextCancel()
+	assert.Equal(t, "Bearer test-oauth-token", next.Value(schemas.BifrostContextKeyRequestHeaders).(map[string]string)["authorization"])
+}
+
+func TestCreateBifrostContextFromAuth_DirectKeyGate(t *testing.T) {
+	cases := []struct {
+		name                                  string
+		allow                                 bool
+		flag, bearer, apiKey, googleKey, want string
+	}{
+		{name: "enabled bearer", allow: true, flag: "true", bearer: "bEaReR test-token", want: "test-token"},
+		{name: "server disabled", flag: "true", bearer: "Bearer test-token"},
+		{name: "flag absent", allow: true, bearer: "Bearer test-token"},
+		{name: "flag false", allow: true, flag: "false", bearer: "Bearer test-token"},
+		{name: "virtual key not upstream credential", allow: true, flag: "true", bearer: "Bearer sk-bf-test"},
+		{name: "API key fallback", allow: true, flag: "true", apiKey: " test-api ", want: "test-api"},
+		{name: "Google key fallback", allow: true, flag: "true", googleKey: "test-google", want: "test-google"},
+		{name: "bearer precedence", allow: true, flag: "true", bearer: "Bearer test-token", apiKey: "test-api", want: "test-token"},
+		{name: "empty bearer", allow: true, flag: "true", bearer: "Bearer "},
+		{name: "non bearer", allow: true, flag: "true", bearer: "Basic test"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			auth := &authHeaders{authorization: tc.bearer, apiKey: tc.apiKey, googAPIKey: tc.googleKey, headers: map[string][]string{"x-bf-direct-key": {tc.flag}}}
+			ctx, cancel := createBifrostContextFromAuth(testWSHandlerStore{allowDirectKeys: tc.allow}, auth)
+			defer cancel()
+			key, ok := ctx.Value(schemas.BifrostContextKeyDirectKey).(schemas.Key)
+			if tc.want == "" {
+				assert.False(t, ok)
+				return
+			}
+			if !ok {
+				t.Fatal("missing direct key")
+			}
+			assert.Equal(t, tc.want, key.Value.Val)
+			if ctx.Grant() == nil || ctx.Grant().Identity() == nil {
+				t.Fatal("missing settled identity")
+			}
+			assert.Empty(t, ctx.Grant().Identity().Credential().Value, "direct key selects upstream credentials; it does not identify the gateway caller")
+		})
+	}
 }

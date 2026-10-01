@@ -802,6 +802,51 @@ func createBifrostContextFromAuth(handlerStore lib.HandlerStore, auth *authHeade
 			ctx.SetValue(schemas.BifrostContextKeyVirtualKey, auth.googAPIKey)
 		}
 	}
+	// Each event owns its header/dimension maps; plugins must not mutate the
+	// connection's captured headers or lose OAuth attribution on later events.
+	requestHeaders := make(map[string]string, len(auth.headers))
+	dimensions := make(map[string]string)
+	for name, values := range auth.headers {
+		name = strings.ToLower(name)
+		for _, value := range values {
+			requestHeaders[name] = value
+			if label, ok := strings.CutPrefix(name, "x-bf-dim-"); ok && label != "" && label != "path" && label != "method" {
+				dimensions[label] = value
+			}
+		}
+	}
+	ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, requestHeaders)
+	if len(dimensions) > 0 {
+		ctx.SetValue(schemas.BifrostContextKeyDimensions, dimensions)
+	}
+
+	// Match HTTP direct-key extraction: require both administrator and caller
+	// opt-in. Authorization stays out of generic forwarded extra headers.
+	if handlerStore != nil && handlerStore.ShouldAllowDirectKeys() && requestHeaders["x-bf-direct-key"] == "true" {
+		var directKey string
+		if strings.HasPrefix(strings.ToLower(auth.authorization), "bearer ") {
+			token := strings.TrimSpace(auth.authorization[7:])
+			if token != "" && !strings.HasPrefix(strings.ToLower(token), "sk-bf-") {
+				directKey = token
+			}
+		}
+		if directKey == "" {
+			for _, value := range []string{auth.apiKey, auth.googAPIKey} {
+				value = strings.TrimSpace(value)
+				if value != "" && !strings.HasPrefix(strings.ToLower(value), "sk-bf-") {
+					directKey = value
+					break
+				}
+			}
+		}
+		if directKey != "" {
+			ctx.SetValue(schemas.BifrostContextKeyDirectKey, schemas.Key{
+				ID: "header-provided", Name: "header-provided",
+				Value: schemas.SecretVar{Val: directKey}, Models: []string{}, Weight: 1.0,
+			})
+		}
+	}
+
 	// The headers captured at upgrade are all this connection will ever present, so the identity is
 	// settled here the way the HTTP path settles it, a connection that presented nothing included:
 	// governance refuses a request nobody settled, and a keyless connection is not that.
